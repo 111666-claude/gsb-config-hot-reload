@@ -1,6 +1,4 @@
 // Package hotreload 是配置热更：版本号单调、发布时快照拷贝、可回滚、发布幂等。
-// 缺陷：原地改共享 map（读到半份配置）、不校验版本（旧版本覆盖新版本）、回滚不支持、
-// 每次查询全扫历史。
 package hotreload
 
 // Config 是一份配置快照。
@@ -21,33 +19,55 @@ type Store struct {
 // NewStore 建仓库。
 func NewStore() *Store { return &Store{} }
 
-// Publish 发布一份配置，返回是否生效与原因。
-// 缺陷：直接改共享的 map（不是原子替换，调用方改自己那份也会影响线上）、
-// 不校验版本号（旧版本照样覆盖）、重复发布同一版本也重复计数。
-func (s *Store) Publish(version int, values map[string]int) (bool, string) {
-	if s.current == nil {
-		s.current = &Config{Version: version, Values: values}
-	} else {
-		s.current.Values = values
-		s.current.Version = version
+func cloneValues(values map[string]int) map[string]int {
+	cloned := make(map[string]int, len(values))
+	for key, value := range values {
+		cloned[key] = value
 	}
-	s.history = append(s.history, s.current)
+	return cloned
+}
+
+// Publish 发布一份配置，返回是否生效与原因。
+// 只有严格大于历史最高版本的发布才生效；相等返回 duplicate，更小返回 stale。
+// 生效的配置是发布那一刻的拷贝，之后调用方改自己的 map 不影响线上。
+func (s *Store) Publish(version int, values map[string]int) (bool, string) {
+	if s.published > 0 {
+		if version == s.maxVersion {
+			return false, "duplicate"
+		}
+		if version < s.maxVersion {
+			return false, "stale"
+		}
+	}
+	snapshot := &Config{Version: version, Values: cloneValues(values)}
+	s.current = snapshot
+	s.history = append(s.history, snapshot)
 	s.maxVersion = version
 	s.published++
 	return true, "ok"
 }
 
-// Current 是当前配置。缺陷：把内部对象直接给出去了。
-func (s *Store) Current() *Config { return s.current }
-
-// Rollback 回滚上一版。缺陷：没有实现。
-func (s *Store) Rollback() bool { return false }
-
-// Published 是发布成功次数。缺陷：每次全扫历史。
-func (s *Store) Published() int {
-	s.scanned += len(s.history)
-	return s.published
+// Current 是当前配置的拷贝，内部之后的改动不影响已返回的这份。
+func (s *Store) Current() *Config {
+	if s.current == nil {
+		return nil
+	}
+	return &Config{Version: s.current.Version, Values: cloneValues(s.current.Values)}
 }
+
+// Rollback 回滚到上一版并返回 true；没有上一版返回 false。
+// 回滚不改变历史最高版本，旧版本发布仍被拒绝。
+func (s *Store) Rollback() bool {
+	if len(s.history) < 2 {
+		return false
+	}
+	s.history = s.history[:len(s.history)-1]
+	s.current = s.history[len(s.history)-1]
+	return true
+}
+
+// Published 是发布成功次数，O(1) 读取计数，不全扫历史。
+func (s *Store) Published() int { return s.published }
 
 // Scanned 是累计扫描的历史条数（规模观测）。
 func (s *Store) Scanned() int { return s.scanned }
